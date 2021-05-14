@@ -1,0 +1,526 @@
+---
+title: "Multi-state quitting - code"
+author: "Nick ten Broeke (11912219)"
+date: "5/14/2021"
+output: html_document
+---
+
+This is an extremely simplified version of the analysis descriped in "Why Players Quit: a Multi-State Perspective on Quitting in an Online Learning Environment for Primary School Children". Its intention is to offer researchers who are interested in using a similar multi-state framework a template which can be used to run their analyses. A fake, minimal dataset is provided which is based on randomly generated data. In addition to offering a step-by-step on how to set up the multi-state analysis it provides various useful pieces of code which were used for variable creation. 
+
+# Preparation
+
+```{r}
+
+library("msm")
+library("tidyverse")
+library("data.table")
+library("lubridate")
+```
+
+```{r}
+# Creating some fake data
+logs_dt <- data.frame(user_id = c(1,1,1,1,1,1,1,1,1,1,
+                                  2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,
+                                  3,3,3,3,3),
+                              created = lubridate::now() + lubridate::seconds(seq_len(30) * 20 + rnorm(1,100,2)),
+                              correct_answered = sample(c(0,1), 30, T),
+                              response_in_milliseconds = round(rexp(30, 0.0001),0),
+                              session_count = c(1,2,3,4,5,6,7,8,9,10,
+                                                1,2,3,1,2,3,4,5,6,7,8,9,10,1,2,
+                                                1,2,3,4,5),
+                              difficulty = as.factor(c(1,1,1,1,1,1,1,1,1,1,
+                                                0,0,0,1,1,1,1,1,1,1,1,1,1,2,2,
+                                                1,1,1,1,1)))
+
+logs_dt$date <- as.Date(logs_dt$created)
+logs_dt$time <- format(logs_dt$created, "%H:%M:%S")
+
+logs_dt <- data.table(logs_dt)
+```
+
+
+### Making states
+
+The next two chunks have code which create the state variable. It takes quite a few steps and will take about 10-15 minutes to run. I'm making the state variable over the whole dataset first so that I have more flexibility later. For the main analyses I will take a subset of the data.
+
+```{r}
+# First I make a time difference column which denotes the time between a response x and x-1.
+logs_dt[,
+        diff := difftime(time1 = created, 
+                         time2 = shift(created, type = "lag"), 
+                         units = "mins"), 
+            by = .(user_id, date)]
+
+logs_dt$diff <- round(logs_dt$diff,0)
+
+# The first of which has no x-1 which results in a NA, I replace these NA's with 0 here.
+logs_dt$diff[is.na(logs_dt$diff)] <- 0
+
+# This is a function which loops through the new diff column to detect when the difference between x and x-1 exceeds an hour. I count this as a new session. 
+time_detecter <- function(x) {
+  
+  game <- 1
+  bin <- numeric()
+  
+  for (i in 1:length(x)) {
+    if(x[i] < 30) {
+      bin[i] <- game
+    } else if(x[i] >= 30) {
+      game <- game + 1
+      bin[i] <- game
+    }
+  }
+  return(bin)
+}
+
+logs_dt[, 
+        session_id := sapply(.SD, time_detecter), 
+        by = .(user_id, date),
+        .SDcols = "diff"]
+```
+
+Now I can make a variable which denotes the state of a player on each problem.
+
+```{r}
+# This is a function which loops through the session_count variable to detect whether a player does a soft-quit within a session.
+state_maker <- function(x) {
+  
+  # I look at the difference between the session_counter variable at x and x+1 to determine whether a player switched games or not.
+  x2 <- shift(x, type = "lead", fill = -1)
+  sub <- x - x2
+  eval <- 1
+  
+  bin <- numeric()
+  
+  for (i in 1:length(sub)) {
+    # If the difference is -1, 0 or 1 then the player is either still playing the same game or has started a game and stopped at problem 1 or 2. 
+    if(sub[i] < 2) {
+      bin[i] <- eval
+      # A difference of 9 implies a game was finished and then they started a new game (10 - 1 = 9)
+    } else if (sub[i] == 9) {
+      eval = 1
+      bin[i] <- eval
+    } else if(sub[i] != 9) {
+      # Otherwise it's a quit.
+      eval <- eval + 1
+      bin[i] <- eval
+    } 
+    }
+
+  # When a player does multiple soft-quits in a row, the eval counter goes beyond 2. I replace these     values with 2 here as it all counts as the soft-quit state.
+  bin[bin > 2] <- 2
+  return(bin)
+  
+}
+
+logs_dt[, State := sapply(.SD, state_maker), 
+        by = c("user_id", "date", "session_id"),
+        .SDcols = "session_count"]
+```
+
+```{r}
+# In this last step the final state within each session get determined (i.e., was it a soft-quit/hard-quit or did they stop after completing a whole game?)
+
+dt_1 <- logs_dt[,
+        .SD[.N], 
+        by = c("user_id", "date", "session_id")][session_count != 10, 
+                                                 State := 3][session_count == 10, 
+                                                             State := 1]
+
+setkeyv(logs_dt, cols = c("user_id", "created"))
+setkeyv(dt_1, cols = c("user_id", "created"))
+
+logs_dt[dt_1, State := i.State]
+```
+
+### Game_id
+
+Next up is a game_id and sequential error counter.
+
+```{r}
+# Numbering the games played
+game_counter <- function(session_count) {
+  
+  bin <- numeric()
+  game <- 1
+  x <- 0
+  
+  for (i in 1:length(session_count)) {
+
+  if(session_count[i] == x + 1) {
+    bin[i] <- game
+    x <- x + 1
+  } else {
+    game <- game + 1
+    bin[i] <- game
+    x <- 1
+  }
+  }
+  return(bin)
+}
+
+
+logs_dt[, 
+        game_id := sapply(.SD, game_counter), 
+        by = .(user_id, date, session_id),
+        .SDcols = "session_count"]
+```
+
+### Sequential errors
+
+Below I make a new variable which counts how many errors are made in a row. Sometimes players are just clicking through the questions without trying to get the right answer which drives up this sequantial error counter. To fix this I collapse this variable into a factor with levels: 0, 1, 2, 3, >3 mistakes in a row. 
+
+```{r}
+# Sequential errors
+error_counter <- function(x) {
+  
+  store <- numeric()
+  count <- 0
+  
+  for(i in 1:length(x))
+  if(x[i] == 1) {
+    count <- 0
+    store[i] <- count
+  } else {
+    count <- count + 1
+    store[i] <- count
+  }
+  return(store)
+} 
+
+# Converts to factor
+fact_cov <- function(x) {
+  if(x == 0) {
+    return("0")
+  } else if(x == 1) {
+    return("1")
+  } else if(x == 2) {
+    return("2")
+  } else if(x == 3) {
+    return("3")
+  } else {
+    return(">3")
+  }
+}
+
+# Counting all sequantial errors
+logs_dt[, 
+        error_seq := sapply(.SD, 
+                            error_counter), 
+        by = .(user_id, 
+               date, 
+               session_id),
+        .SDcols = "correct_answered"]
+# Shifting backwards so that msm can understand the influence of the covariate.
+logs_dt[,error_seq := shift(error_seq, type = "lead"), by = .(user_id,
+                                                              date, 
+                                                              session_id)]
+logs_dt <- logs_dt %>% fill(error_seq, .direction = "down")
+# Collapsing into factor levels: 0, 1, 2, 3, 4, 5, >5
+logs_dt$error_seq <- sapply(logs_dt$error_seq, fact_cov)
+
+logs_dt$error_seq <- as.factor(logs_dt$error_seq)
+```
+
+### Errors, Fast or Slow
+
+And whether errors made were fast or slow by comparing them to the median reaction time of each player within each domain. Because this is a time dependent covariate we have to shift these values backwards as msm evaluates the value of the covariate at $t-1$ to determine its influence on the state at time $t$.
+
+```{r}
+logs_dt[, 
+        Error_type :=  ifelse(response_in_milliseconds - quantile(response_in_milliseconds)[3] < 0,
+                          "Fast error",
+                          "Slow error"),
+        by = .(user_id)]
+
+# Question mark trials do not count as an error
+logs_dt[correct_answered != 0, Error_type :=  "AAA_No error",]
+
+logs_dt[,Error_type := shift(Error_type, type = "lead"),
+        by = .(user_id, date, session_id)]
+logs_dt <- logs_dt %>% fill(Error_type, .direction = "down")
+```
+
+### MSM Id
+
+```{r}
+logs_dt[, msm_id := .GRP, by = .(user_id, date, session_id)]
+```
+
+
+#### Transition matrix
+
+For msm, I first have to make a transition matrix which determines which transitions are possible. My model is relatively simple as all transitions are allowed except for transitions from the absorbing state (3).
+
+```{r}
+Q <- matrix(data = c(1,1,1,1,1,1,0,0,0),
+            nrow = 3,
+            ncol = 3,
+            byrow = T)
+
+rownames(Q) <- colnames(Q) <- c("Persisting",
+                                "Soft-Quit",
+                                "Hard-Quit")
+
+Q
+```
+
+#### Time difference column
+
+Lastly, it is helpful to compute a time difference column within each session so that I can control and interpret the $t$ argument when doing my analyses.
+
+```{r}
+logs_dt[order(created),
+            diff_s := round(as.numeric(created - head(created, 1), 
+                                     units = 'mins'), 2), 
+            by = .(msm_id)]
+
+# The first of which has no x-1 which results in a NA, I replace these NA's with 0 here.
+logs_dt$diff_s[is.na(logs_dt$diff_s)] <- 0
+```
+
+Converting some variables:
+
+```{r}
+logs_dt$Error_type <- as.factor(logs_dt$Error_type)
+logs_dt$difficulty <- as.factor(logs_dt$difficulty)
+levels(logs_dt$difficulty) <- list(a_medium = "1", b_low  = "0", b_high = "2")
+```
+
+#### Creating extra covariates
+
+```{r}
+# Post error slowing
+pattern_detector <- function(dt) {
+  
+  detec <- str_locate_all(paste0(dt$correct_answered_bu, collapse = ""), pattern = "1101") %>%
+    as.data.frame() %>%
+    mutate(start = start + 1)
+  
+  rep <- rep(NA, nrow(dt))
+  
+  PES <- dt$response_in_milliseconds[detec$end] - dt$response_in_milliseconds[detec$start]
+  rep[detec$end] <- PES
+  return(rep)
+  
+}
+
+logs_dt[, PES := pattern_detector(.SD), .(user_id, date, session_id, game_id)]
+```
+
+### Fitting the Models
+
+Creating proportion table of state transitions.
+
+```{r}
+round(prop.table(statetable.msm(State, msm_id, data=logs_dt),1), 4)
+```
+
+We can already see that it is 0.0151 / 0.0061 = 2.49 as common for someone to move into the hard-quit state from the soft-quit state as opposed to when they are in the persisting state.
+
+#### Non Parametric Model
+
+MARKOVIAN PROPERTY
+
+Before fitting any model we should look at whether the Markovian property is tenable, i.e. that any state transition is only dependent on the current state and not on the system's history. We can check this by creating a covariate which denotes the time spent in any state. This covariate should not have an effect on any state transition.
+
+```{r}
+trans <- logs_dt[, State - shift(State, type = "lag"), by = .(msm_id)]$V1
+trans[is.na(trans)] <- 1
+tracker <- ifelse(trans != 0, logs_dt$diff_s, NA)
+
+temp_logs <- logs_dt %>%
+  mutate(tracker = tracker) %>%
+  fill(tracker, .direction = "down")
+
+Markov_Check <- msm(State ~ diff_s, 
+               subject = msm_id, 
+               data = temp_logs, 
+               qmatrix = Q, 
+               obstype = 2,
+               death = 3,
+               gen.inits = TRUE,
+               covariates = ~ tracker)
+Markov_Check
+rm(temp_logs)
+rm(Markov_Check)
+```
+
+We can see that the the influence of time spent in a state is negligible for all state transitions proving that the Markovian assumption is tenable.
+
+Now we are finally ready to fit the first model. I will begin with a model which does not use any covariates to see how the states relate to each other. This also allows for model comparison later on to see if adding covariates results in significant model fit improvement.
+
+```{r}
+cav_msm_nocov <- msm(State ~ diff_s, 
+               subject = msm_id, 
+               data = logs_dt, 
+               qmatrix = Q, 
+               obstype = 2,
+               death = 3,
+               gen.inits = TRUE)
+
+cav_msm_nocov
+```
+
+The instantaneous risk associated with a hard-quit is 0.03902 / 0.02035 = 1.9 times greater when already in a soft-quit state. The width of the computed confidence intervals shows how much statistical power we already have (even on a subset of the data).
+
+```{r}
+pmatrix.msm(cav_msm_nocov) 
+```
+
+This matrix denotes the probability that a person will eventually end up in state $l$ (rows) given they are in state $s$ (columns). 
+
+```{r}
+sojourn.msm(cav_msm_nocov)
+```
+
+
+#### Adding Covariates to the Model
+
+```{r}
+logs_dt$PES[is.na(logs_dt$PES)] <- 0
+
+
+cav_msm_cov <- msm(State ~ diff_s, 
+               subject = msm_id, 
+               data = logs_dt, 
+               qmatrix = Q, 
+               obstype = 2,
+               death = 3,
+               gen.inits = TRUE,
+               covariates = ~ Error_type + difficulty + error_seq)
+
+hazard.msm(cav_msm_cov)
+```
+
+To see whether adding the covariates improves model fit, we can run a likelihood ratio test.
+
+```{r}
+lrtest.msm(cav_msm_nocov, cav_msm_cov)
+```
+
+### Making predictions
+
+As an indication of the validity of the model, we can look at the predictions it makes for the final problem of randomly selected sessions. If the model predicts either a soft- or hard-quit, we make a quit prediction and a no-quit otherwise.
+
+```{r}
+test_set <- sample(logs_dt$msm_id, 2)
+
+# Retrieve the indices of the final problem of 10000 randomly selected sessions.
+save <- logs_dt[msm_id %in% test_set, .I[.N], .(msm_id)]
+```
+
+First a baseline MSE:
+
+```{r}
+baseline_prob <- logs_dt %>%
+  group_by(msm_id) %>%
+  mutate(sum_3 = sum(State == 3)) %>%
+  ungroup() %>%
+  count(sum_3) %>%
+  mutate(prop = n / sum(n))
+
+
+prob_quit <- baseline_prob$prop[2]
+prob_noquit <- baseline_prob$prop[1]
+```
+
+```{r}
+# Make empty vectors
+quit_prob <- numeric()
+pred <- numeric()
+real_state <- numeric()
+
+for (i in 1:nrow(save)) {
+
+# Retrieve the correct final state
+x2 <- logs_dt[c(save$V1),,][i]
+
+# If the real state was persisting it is a no-quit
+if(x2$State == 1) {
+  real_state[i] <- "no-quit"
+# If the real state was either a soft-quit or hard-quit, it's a quit
+ } else {
+  real_state[i] <- "quit"
+ }
+
+pred[i] <- sample(c("quit", "no-quit"), 1, prob = c(prob_quit, prob_noquit))
+
+if(pred[i] == "quit") {
+  quit_prob[i] <- prob_quit
+} else {
+  quit_prob[i] <- prob_noquit 
+}
+}
+
+MSE <- mean((ifelse(real_state == "quit", 1, 0) - quit_prob)^2)
+MSE
+
+table(real_state, pred)
+
+```
+
+Model MSE on testset:
+
+```{r}
+# Make empty vectors
+quit_prob <- numeric()
+pred <- numeric()
+real_state <- numeric()
+
+for (i in 1:nrow(save)) {
+
+# Retrieve information of the second to last problem within the session
+x <- logs_dt[c(save$V1 - 1),,][i,.(error_seq, 
+                                   difficulty, 
+                                   Error_type, 
+                                   State,
+                                   PES,
+                                   diff_s),]
+# Retrieve the correct final state
+x2 <- logs_dt[c(save$V1),,][i]
+
+# Calculate transition probability matrix 30 seconds into the future, given the current covariate vector
+t <- pmatrix.msm(cav_msm_cov, t = x$diff_s + 1, covariates = list(x$Error_type,
+                                                                         x$difficulty,
+                                                                       x$error_seq))
+
+# If the real state was persisting it is a no-quit
+if(x2$State == 1) {
+  real_state[i] <- "no-quit"
+# If the real state was either a soft-quit or hard-quit, it's a quit
+ } else {
+  real_state[i] <- "quit"
+ }
+
+# The model was biased towards predicting a persisting state and so the probability threshold for which the model would make a quit prediction had to be tuned down a bit. This parameter was tuned by hand.
+probs <- t[x$State,]
+  if(probs[1] < 0.55) {
+  pred[i] <- "quit"
+  quit_prob[i] <- sum(probs[2], probs[3])
+} else {
+  pred[i] <- "no-quit"
+  quit_prob[i] <- sum(probs[2], probs[3])
+}
+
+}
+
+MSE <- mean((ifelse(real_state == "quit", 1, 0) - quit_prob)^2)
+MSE
+
+table(real_state, pred)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
